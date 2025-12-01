@@ -1,0 +1,494 @@
+/*
+ * This file is part of Universal Media Server, based on PS3 Media Server.
+ *
+ * This program is a free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the Free
+ * Software Foundation; version 2 of the License only.
+ *
+ * This program is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+ * FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
+ * details.
+ *
+ * You should have received a copy of the GNU General Public License along with
+ * this program; if not, write to the Free Software Foundation, Inc., 51
+ * Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
+ */
+package net.pms.store.container;
+
+import java.io.BufferedReader;
+import java.io.BufferedWriter;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.net.URI;
+import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import net.pms.PMS;
+import net.pms.database.MediaTableContainerFiles;
+import net.pms.database.MediaTableFiles;
+import net.pms.dlna.DLNAThumbnailInputStream;
+import net.pms.formats.Format;
+import net.pms.formats.FormatFactory;
+import net.pms.parsers.WebStreamParser;
+import net.pms.renderers.Renderer;
+import net.pms.store.PlaylistManager;
+import net.pms.store.StoreContainer;
+import net.pms.store.StoreResource;
+import net.pms.store.item.FeedItem;
+import net.pms.store.item.RealFile;
+import net.pms.store.item.WebAudioStream;
+import net.pms.store.item.WebVideoStream;
+import net.pms.store.utils.StoreResourceSorter;
+import net.pms.util.FileUtil;
+import net.pms.util.ProcessUtil;
+import org.apache.commons.io.FilenameUtils;
+import org.apache.commons.io.input.BOMInputStream;
+import org.apache.commons.lang3.StringUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+public final class PlaylistFolder extends StoreContainer {
+
+	private static final Logger LOGGER = LoggerFactory.getLogger(PlaylistFolder.class);
+
+	public static final String DIRECTIVE_ALBUMART_URI = "#EXTIMG:";
+	public static final String DIRECTIVE_RADIOBROWSERUUID = "#RADIOBROWSERUUID:";
+
+	private final String uri;
+	private final boolean isweb;
+	private final int defaultContent;
+	private boolean utf8 = false;
+
+	public PlaylistFolder(Renderer renderer, String name, String uri, int type) {
+		super(renderer, name, null);
+		this.uri = uri;
+		isweb = FileUtil.isUrl(uri);
+		super.setLastModified(isweb ? 0 : new File(uri).lastModified());
+		defaultContent = (type != 0 && type != Format.UNKNOWN) ? type : Format.VIDEO;
+		utf8 = "m3u8".equalsIgnoreCase(getExtension().toLowerCase());
+	}
+
+	public PlaylistFolder(Renderer renderer, File f) {
+		super(renderer, f.getName(), null);
+		uri = f.getAbsolutePath();
+		isweb = false;
+		super.setLastModified(f.lastModified());
+		defaultContent = Format.VIDEO;
+		utf8 = "m3u8".equalsIgnoreCase(getExtension().toLowerCase());
+	}
+
+	public File getPlaylistfile() {
+		return isweb ? null : new File(uri);
+	}
+
+	@Override
+	public boolean allowScan() {
+		return true;
+	}
+
+	@Override
+	public String getSystemName() {
+		return isweb ? uri : ProcessUtil.getSystemPathName(uri);
+	}
+
+	@Override
+	public boolean isValid() {
+		return true;
+	}
+
+	@Override
+	public void discoverChildren() {
+		resolve();
+	}
+
+	private boolean isM3uPlaylist() {
+		if (getExtension() != null) {
+			// m3u is not required to have a header, if there is an extension and it matches known m3u, assume m3u
+			switch (getExtension()) {
+				case "m3u" -> {
+					return true;
+				}
+				case "m3u8" -> {
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	/** Attempts to return a lowercase file extension from uri (excluding the dot) or null */
+	private String getExtension() {
+		String extension;
+		if (FileUtil.isUrl(uri)) {
+			extension = FileUtil.getUrlExtension(uri);
+		} else {
+			extension = FileUtil.getExtension(uri);
+		}
+		if (extension != null) {
+			extension = extension.toLowerCase(PMS.getLocale());
+		}
+		return extension;
+	}
+
+	private BufferedReader getBufferedReader(boolean utf8) throws IOException {
+		Charset charset;
+		if (utf8) {
+			charset = StandardCharsets.UTF_8;
+		} else {
+			charset = StandardCharsets.ISO_8859_1;
+		}
+		if (FileUtil.isUrl(uri)) {
+			BOMInputStream bi = BOMInputStream.builder().setInputStream(URI.create(uri).toURL().openStream()).get();
+			return new BufferedReader(new InputStreamReader(bi, charset));
+		} else {
+			File playlistfile = new File(uri);
+			if (playlistfile.length() < 10000000) {
+				FileInputStream inputStream = new FileInputStream(playlistfile);
+				BOMInputStream bi = BOMInputStream.builder().setInputStream(inputStream).get();
+				return new BufferedReader(new InputStreamReader(bi, charset));
+			}
+		}
+		return null;
+	}
+
+	@Override
+	public DLNAThumbnailInputStream getThumbnailInputStream() throws IOException {
+		File thumbnailImage;
+		if (!isweb) {
+			thumbnailImage = new File(FilenameUtils.removeExtension(uri) + ".png");
+			if (!thumbnailImage.exists() || thumbnailImage.isDirectory()) {
+				thumbnailImage = new File(FilenameUtils.removeExtension(uri) + ".jpg");
+			}
+			if (!thumbnailImage.exists() || thumbnailImage.isDirectory()) {
+				thumbnailImage = new File(FilenameUtils.getFullPath(uri) + "folder.png");
+			}
+			if (!thumbnailImage.exists() || thumbnailImage.isDirectory()) {
+				thumbnailImage = new File(FilenameUtils.getFullPath(uri) + "folder.jpg");
+			}
+			if (!thumbnailImage.exists() || thumbnailImage.isDirectory()) {
+				return super.getThumbnailInputStream();
+			}
+			DLNAThumbnailInputStream result = null;
+			try {
+				LOGGER.debug("PlaylistFolder albumart path : " + thumbnailImage.getAbsolutePath());
+				result = DLNAThumbnailInputStream.toThumbnailInputStream(new FileInputStream(thumbnailImage));
+			} catch (IOException e) {
+				LOGGER.debug("An error occurred while getting thumbnail for \"{}\", using generic thumbnail instead: {}", getName(),
+						e.getMessage());
+				LOGGER.trace("", e);
+			}
+			return result != null ? result : super.getThumbnailInputStream();
+		}
+		return null;
+	}
+
+	@Override
+	public void resolve() {
+		getChildren().clear();
+		File playlistFile = getPlaylistfile();
+		if (playlistFile != null) {
+			setLastModified(playlistFile.lastModified());
+		}
+		resolveOnce();
+	}
+
+	@Override
+	protected void resolveOnce() {
+		Long containerId = MediaTableFiles.getOrInsertFileId(uri, getLastModified(), Format.PLAYLIST);
+
+		List<Entry> entries = getPlaylistEntries();
+		for (Entry entry : entries) {
+			if (entry == null) {
+				continue;
+			}
+			LOGGER.debug("Adding playlist entry: {}", entry);
+
+			if (!isweb && !FileUtil.isUrl(entry.fileName)) {
+				int type = defaultContent;
+				String ext = FileUtil.getUrlExtension(entry.fileName);
+				if (ext != null) {
+					ext = "." + ext;
+					Format f = FormatFactory.getAssociatedFormat(ext);
+					if (f != null) {
+						type = f.getType();
+					}
+				}
+				File en = new File(FilenameUtils.concat(new File(uri).getParent(), entry.fileName));
+				if (en.exists()) {
+					if (type == Format.PLAYLIST) {
+						addChild(new PlaylistFolder(renderer, en));
+					} else {
+						addChild(new RealFile(renderer, en, entry.title));
+					}
+				}
+			} else {
+				String u = FileUtil.urlJoin(uri, entry.fileName);
+				Integer type = MediaTableFiles.getFormatType(u);
+				if (type == null || type == 0) {
+					type = WebStreamParser.getWebStreamType(entry.fileName, defaultContent);
+				}
+				StoreResource d = switch (type) {
+					case Format.VIDEO -> new WebVideoStream(renderer, entry.title, u, null, entry.directives);
+					case Format.AUDIO -> new WebAudioStream(renderer, entry.title, u, null, entry.directives);
+					case Format.IMAGE -> new FeedItem(renderer, entry.title, u, null, null, Format.IMAGE);
+					case Format.PLAYLIST -> PlaylistManager.getPlaylist(renderer, entry.title, u, 0);
+					default -> null;
+				};
+
+				if (d != null) {
+					addChild(d);
+					Long entryId;
+					if (d instanceof StoreContainer storeContainer) {
+						entryId = MediaTableFiles.getOrInsertFileId(u, storeContainer.getLastModified(), type);
+					} else {
+						entryId = MediaTableFiles.getOrInsertFileId(u, 0L, type);
+					}
+					MediaTableContainerFiles.addContainerEntry(containerId, entryId);
+				}
+			}
+		}
+
+		if (renderer.getUmsConfiguration().getSortMethod(getPlaylistfile()) == StoreResourceSorter.SORT_RANDOM) {
+			Collections.shuffle(getChildren());
+		}
+
+		for (StoreResource r : getChildren()) {
+			r.syncResolve();
+		}
+	}
+
+	public boolean deleteEntry(String url) {
+		try (BufferedReader br = getBufferedReader(utf8)) {
+			boolean entryRemoved = false;
+			StringBuilder out = new StringBuilder();
+			StringBuilder lastEntry = new StringBuilder();
+			if (!isM3uPlaylist()) {
+				LOGGER.debug("deleting playlists entries active only for m3u or m3u8 files. This playlist is {}", getExtension());
+				return false;
+			}
+			out.append(lastEntry);
+			String line = "";
+			lastEntry = new StringBuilder();
+			while (br != null &&  (line = br.readLine()) != null) {
+				line = line.trim();
+				if (line.startsWith("#")) {
+					lastEntry.append(line).append(System.getProperty("line.separator"));
+				} else if (StringUtils.isAllBlank(line)) {
+					lastEntry.append(System.getProperty("line.separator"));
+				} else {
+					// Parsing finished. This line is the filename.
+					if (!line.equalsIgnoreCase(url)) {
+						lastEntry.append(line).append(System.getProperty("line.separator"));
+						out.append(lastEntry);
+					} else {
+						entryRemoved = true;
+					}
+					lastEntry = new StringBuilder();
+				}
+			}
+
+			if (entryRemoved) {
+				writeContentToFile(out);
+			}
+			return entryRemoved;
+		} catch (Exception er) {
+			LOGGER.error("deleteEntry", er);
+			throw new RuntimeException("deleteEntry", er);
+		}
+	}
+
+
+	public void updateAlbumArtUriDirective(String url, String externalAlbumArtUri) {
+		boolean firstline = true;
+		try (BufferedReader br = getBufferedReader(utf8)) {
+			StringBuilder out = new StringBuilder();
+			if (!isM3uPlaylist()) {
+				LOGGER.debug("updating album art is only possible for m3u or m3u8 files. This playlist is {}", getExtension());
+				return;
+			}
+			String line = "";
+			StringBuilder lastEntry = new StringBuilder();
+			String lastAlbumArtDirective = null;
+			while (br != null &&  (line = br.readLine()) != null) {
+				line = line.trim();
+				if (firstline) {
+					firstline = false;
+					if (!"#EXTM3U".equals(line.trim())) {
+						LOGGER.debug("adding missing #EXTM3U directive.");
+						lastEntry.append("#EXTM3U\n\n");
+					}
+				}
+				if (line.startsWith(DIRECTIVE_ALBUMART_URI)) {
+					lastAlbumArtDirective = line.substring(DIRECTIVE_ALBUMART_URI.length());
+				} else if (line.startsWith("#")) {
+					lastEntry.append(line).append(System.getProperty("line.separator"));
+				} else if (StringUtils.isAllBlank(line)) {
+					lastEntry.append(System.getProperty("line.separator"));
+				} else {
+					// Parsing finished. This line is the filename.
+					if (line.equalsIgnoreCase(url)) {
+						lastEntry.append(DIRECTIVE_ALBUMART_URI).append(externalAlbumArtUri).append(System.getProperty("line.separator"));
+					} else {
+						if (lastAlbumArtDirective != null) {
+							lastEntry.append(DIRECTIVE_ALBUMART_URI).append(lastAlbumArtDirective).append(System.getProperty("line.separator"));
+						}
+					}
+					lastEntry.append(line).append(System.getProperty("line.separator"));
+					out.append(lastEntry);
+					lastEntry = new StringBuilder();
+					lastAlbumArtDirective = null;
+				}
+			}
+
+			writeContentToFile(out);
+		} catch (Exception er) {
+			LOGGER.error("updateAlbumArtUriDirective", er);
+		}
+	}
+
+	private void writeContentToFile(StringBuilder out) throws IOException {
+		File file = new File(getFileName());
+		BufferedWriter writer = null;
+		try {
+			LOGGER.debug("writing playlist file ...");
+			writer = new BufferedWriter(new FileWriter(file));
+			writer.append(out);
+			file.setLastModified(System.currentTimeMillis());
+		} catch (Exception e) {
+			LOGGER.warn("cannot update playlist", e);
+		} finally {
+			if (writer != null) {
+				writer.close();
+			}
+		}
+	}
+
+	private boolean isExtendedM3uPlaylist(BufferedReader br) throws IOException {
+		return isExtendedM3uPlaylist(br, null);
+	}
+
+	private boolean isExtendedM3uPlaylist(BufferedReader br, StringBuilder cache) throws IOException {
+		String line;
+		while (br != null && (line = br.readLine()) != null) {
+			if (cache != null) {
+				cache.append(line).append(System.getProperty("line.separator"));
+			}
+			line = line.trim();
+			if (line.startsWith("#EXTM3U")) {
+				LOGGER.debug("Reading m3u playlist: " + getName());
+				return true;
+			} else if (line.length() > 0 && line.equals("[playlist]")) {
+				LOGGER.debug("Reading PLS playlist: " + getName());
+				return false;
+			}
+		}
+		LOGGER.debug("unknown playlist type: " + getName());
+		return false;
+	}
+
+	private List<Entry> getPlaylistEntries() {
+		List<Entry> entries = new ArrayList<>();
+		String extension = getExtension();
+		try (BufferedReader br = getBufferedReader(utf8)) {
+			String line;
+			String fileName;
+			String title = null;
+			String playlistType = getExtension();
+			Map<String, String> directives = new HashMap<>();
+			while (br != null &&  (line = br.readLine()) != null) {
+				line = line.trim();
+				if ("pls".equals(playlistType)) {
+					if (line.length() > 0 && !line.startsWith("#")) {
+						int eq = line.indexOf('=');
+						if (eq != -1) {
+							String value = line.substring(eq + 1);
+							String valueType = line.substring(0, eq).toLowerCase();
+							fileName = null;
+							title = null;
+							int index = 0;
+							if (valueType.startsWith("file")) {
+								index = Integer.parseInt(valueType.substring(4));
+								fileName = value;
+							} else if (valueType.startsWith("title")) {
+								index = Integer.parseInt(valueType.substring(5));
+								title = value;
+							}
+							if (index > 0) {
+								while (entries.size() < index) {
+									entries.add(null);
+								}
+								Entry entry = entries.get(index - 1);
+								if (entry == null) {
+									entry = new Entry();
+									entries.set(index - 1, entry);
+								}
+								if (fileName != null) {
+									entry.fileName = fileName;
+								}
+								if (title != null) {
+									entry.title = title;
+								}
+							}
+						}
+					}
+				} else if (isM3uPlaylist()) {
+					if (line.startsWith("#EXTINF:")) {
+						line = line.substring(8).trim();
+						if (line.matches("^-?\\d+,.+")) {
+							title = line.substring(line.indexOf(',') + 1).trim();
+						} else {
+							title = line;
+						}
+					} else if (line.toUpperCase().startsWith(DIRECTIVE_RADIOBROWSERUUID)) {
+						directives.put(DIRECTIVE_RADIOBROWSERUUID, line.substring(DIRECTIVE_RADIOBROWSERUUID.length()));
+					} else if (line.toUpperCase().startsWith(DIRECTIVE_ALBUMART_URI)) {
+						directives.put(DIRECTIVE_ALBUMART_URI, line.substring(DIRECTIVE_ALBUMART_URI.length()));
+					} else if (!line.startsWith("#") && !line.matches("^\\s*$")) {
+						// Non-comment and non-empty line contains the filename
+						fileName = line;
+						Entry entry = new Entry();
+						entry.fileName = fileName;
+						entry.title = title;
+						entry.directives = directives;
+						entries.add(entry);
+						title = null;
+						directives = new HashMap<>();
+					}
+				}
+			}
+		} catch (NumberFormatException | IOException e) {
+			LOGGER.error(null, e);
+		}
+		return entries;
+	}
+
+	private static class Entry {
+
+		private String fileName;
+		private String title;
+		private Map<String, String> directives;
+
+		@Override
+		public String toString() {
+			return "[" + fileName + "," + title + "]";
+		}
+	}
+
+	@Override
+	public String getDisplayName(boolean withSuffix) {
+		String displayName = super.getDisplayNameBase();
+		if (displayName.contains(".")) {
+			displayName = displayName.substring(0, displayName.lastIndexOf("."));
+		}
+		return displayName;
+	}
+
+}
